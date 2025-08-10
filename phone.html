@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>SirenNet+ — Phone Node</title>
+<style>
+  :root{--bg:#0a0f1a;--card:#111a2e;--pri:#7ef0ff;--ok:#50fa7b;--muted:#9fb0c5}
+  *{box-sizing:border-box;font-family:Inter,system-ui,Segoe UI,Roboto,Arial,sans-serif}
+  body{margin:0;background:linear-gradient(180deg,#0a0f1a,#0c1222);color:#e6edf3}
+  header{padding:16px;border-bottom:1px solid #1f2947;background:#0b1221}
+  main{padding:16px;max-width:860px;margin:0 auto;display:grid;gap:14px}
+  .card{background:var(--card);border:1px solid #1c2540;border-radius:18px;padding:16px;box-shadow:0 10px 30px rgba(0,0,0,.25)}
+  label{display:block;font-size:12px;color:var(--muted);margin-bottom:6px}
+  input,textarea{width:100%;padding:10px;border-radius:12px;border:1px solid #29314f;background:#0d1326;color:#e6edf3}
+  textarea{min-height:120px}
+  button{background:#182443;border:1px solid #2a365e;color:#e6edf3;padding:10px 14px;border-radius:12px;cursor:pointer;transition:.2s}
+  button:hover{transform:translateY(-1px);box-shadow:0 6px 20px rgba(0,0,0,.3)}
+  .pill{display:inline-block;padding:6px 10px;border-radius:999px;border:1px solid #2a365e;background:#121a33;font-size:12px;color:#b8c4d8;margin-right:8px}
+  .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+  .metric{padding:10px;border-radius:12px;background:#0f172e;border:1px solid #233058}
+  .metric b{font-size:20px}
+  small{color:#9fb0c5}
+  .mono{font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Courier New", monospace;}
+</style>
+</head>
+<body>
+<header><h2>🚨 SirenNet+ — Phone Node</h2></header>
+<main>
+  <div class="card">
+    <div class="grid">
+      <div>
+        <label>Device Label</label>
+        <input id="label" placeholder="Gate-3 / Van-12" />
+      </div>
+      <div>
+        <label>Sensitivity (0.5 = default)</label>
+        <input id="sens" value="0.5"/>
+      </div>
+    </div>
+    <div style="margin-top:8px;display:flex;gap:10px;flex-wrap:wrap">
+      <button id="grantBtn">1) Grant Mic & Location</button>
+      <button id="offerBtn" disabled>2) Create Offer</button>
+      <button id="startBtn" disabled>3) Start Detection</button>
+    </div>
+    <div style="margin-top:8px;">
+      <span class="pill" id="micP">🎤 mic: -</span>
+      <span class="pill" id="geoP">📍 geo: -</span>
+      <span class="pill" id="rtcP">🔗 rtc: -</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3 style="margin-top:0">WebRTC Signaling (manual)</h3>
+    <div class="grid">
+      <div>
+        <label>Local Offer SDP</label>
+        <textarea id="offerOut" class="mono" readonly></textarea>
+      </div>
+      <div>
+        <label>Paste Laptop Answer SDP</label>
+        <textarea id="answerIn" class="mono" placeholder="paste JSON here"></textarea>
+        <div style="margin-top:8px;"><button id="setAnswerBtn" disabled>Set Answer</button></div>
+      </div>
+    </div>
+    <small>Copy-paste only; once connected, data flows peer-to-peer.</small>
+  </div>
+
+  <div class="card">
+    <h3 style="margin-top:0">Live Detector</h3>
+    <div class="grid">
+      <div class="metric"><div>Confidence (0–1)</div><b id="confVal">–</b></div>
+      <div class="metric"><div>Decision</div><b id="decisionVal">–</b></div>
+    </div>
+    <small>Prototype detector watches 600–1800 Hz bands for periodic sweeps typical of sirens.</small>
+  </div>
+</main>
+
+<script>
+(()=>{
+  const el=id=>document.getElementById(id);
+  const state={ctx:null,an:null,buf:null,dc:null,pc:null,rtc:false,geo:null,haveMic:false};
+  function pill(node, ok, text){ const p=el(node); p.textContent=p.textContent.split(':')[0]+': '+(text|| (ok?'ok':'off')); p.style.color=ok?'#50fa7b':'#b8c4d8'; }
+
+  async function grant(){
+    try{
+      const a=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true},video:false});
+      const AC = window.AudioContext || window.webkitAudioContext;
+      state.ctx = new AC();
+      const src = state.ctx.createMediaStreamSource(a);
+      state.an = state.ctx.createAnalyser();
+      state.an.fftSize = 2048;
+      src.connect(state.an);
+      state.buf = new Uint8Array(state.an.frequencyBinCount);
+      state.haveMic = true;
+      pill('micP', true, 'granted');
+    }catch(e){ pill('micP',false,'denied'); }
+
+    if('geolocation' in navigator){
+      navigator.geolocation.getCurrentPosition(p=>{
+        state.geo={lat:p.coords.latitude, lon:p.coords.longitude};
+        pill('geoP',true,'granted');
+      },_=>pill('geoP',false,'denied'),{enableHighAccuracy:true,timeout:5000});
+      navigator.geolocation.watchPosition(p=>{ state.geo={lat:p.coords.latitude, lon:p.coords.longitude}; });
+    }else pill('geoP',false,'unavailable');
+
+    el('offerBtn').disabled=false;
+  }
+
+  async function createOffer(){
+    const pc = new RTCPeerConnection({iceServers:[{urls:['stun:stun.l.google.com:19302']}]});
+    state.pc=pc;
+    const dc = pc.createDataChannel('sirennet',{ordered:true});
+    state.dc=dc;
+    dc.onopen=()=>{ state.rtc=true; pill('rtcP',true,'connected'); };
+    dc.onclose=()=>{ state.rtc=false; pill('rtcP',false,'closed'); };
+    pc.onicecandidate = ev => { el('offerOut').value = JSON.stringify(pc.localDescription); };
+    const offer = await pc.createOffer(); await pc.setLocalDescription(offer);
+    el('offerOut').value = JSON.stringify(pc.localDescription);
+    el('setAnswerBtn').disabled=false;
+  }
+
+  async function setAnswer(){
+    try{
+      const ans = JSON.parse(el('answerIn').value);
+      await state.pc.setRemoteDescription(new RTCSessionDescription(ans));
+      el('startBtn').disabled=false;
+    }catch(e){ alert('Invalid answer JSON'); }
+  }
+
+  // Siren detector similar to previous version
+  const sample = {A:[],B:[],T:[]};
+  function detect(confBoost){
+    if(!state.an) return {conf:0,dec:false};
+    state.an.getByteFrequencyData(state.buf);
+    const sr = state.ctx.sampleRate || 44100;
+    const n = state.an.frequencyBinCount;
+    const binHz = sr/2/n;
+    function bandAvg(lo,hi){
+      const i0 = Math.max(0, Math.floor(lo/binHz));
+      const i1 = Math.min(n-1, Math.ceil(hi/binHz));
+      let s=0; for(let i=i0;i<=i1;i++) s+= state.buf[i];
+      return s / (i1-i0+1);
+    }
+    const A = bandAvg(600,900);
+    const B = bandAvg(1200,1800);
+    const low = bandAvg(100,400), high = bandAvg(2000,4000);
+    const floor = (low+high)/2 + 1;
+    const aN=A/floor, bN=B/floor;
+    sample.A.push(aN); sample.B.push(bN); sample.T.push(performance.now());
+    if(sample.A.length>30){ sample.A.shift(); sample.B.shift(); sample.T.shift(); }
+    const mean=(arr)=>arr.reduce((p,c)=>p+c,0)/arr.length;
+    const ma = mean(sample.A), mb = mean(sample.B);
+    const varf = (arr,m)=>arr.reduce((p,c)=>p+(c-m)*(c-m),0)/arr.length;
+    const varA = varf(sample.A,ma), varB = varf(sample.B,mb);
+    const alt = Math.abs(aN-bN);
+    let conf = Math.max(0, Math.min(1, (aN+bN)/6 + alt/6 + (varA+varB)/8 ));
+    conf = Math.min(1, conf * (confBoost||1));
+    const decision = conf > 0.6;
+    return {conf, dec:decision};
+  }
+
+  function start(){
+    const label = (el('label').value||'Node-'+Math.floor(1000+Math.random()*9000)).trim();
+    const sens = Math.max(0.2, Math.min(2.0, parseFloat(el('sens').value)||0.5));
+    setInterval(()=>{
+      const out = detect(1.0/sens);
+      el('confVal').textContent = out.conf.toFixed(2);
+      el('decisionVal').textContent = out.dec ? 'SIREN DETECTED' : '—';
+      if(state.dc && state.dc.readyState==='open'){
+        const msg = {
+          type:'siren',
+          device: label,
+          ts: new Date().toISOString(),
+          confidence: out.conf,
+          detected: out.dec,
+          geo: state.geo||null
+        };
+        try{ state.dc.send(JSON.stringify(msg)); }catch(_){}
+      }
+    }, 200);
+  }
+
+  el('grantBtn').addEventListener('click', grant);
+  el('offerBtn').addEventListener('click', createOffer);
+  el('setAnswerBtn').addEventListener('click', setAnswer);
+  el('startBtn').addEventListener('click', start);
+})();
+</script>
+</body>
+</html>
