@@ -129,58 +129,101 @@
   }
 
   // Siren detector similar to previous version
-  const sample = {A:[],B:[],T:[]};
-  function detect(confBoost){
-    if(!state.an) return {conf:0,dec:false};
-    state.an.getByteFrequencyData(state.buf);
-    const sr = state.ctx.sampleRate || 44100;
-    const n = state.an.frequencyBinCount;
-    const binHz = sr/2/n;
-    function bandAvg(lo,hi){
-      const i0 = Math.max(0, Math.floor(lo/binHz));
-      const i1 = Math.min(n-1, Math.ceil(hi/binHz));
-      let s=0; for(let i=i0;i<=i1;i++) s+= state.buf[i];
-      return s / (i1-i0+1);
+  const hist = {a:[], b:[], snr:[], t:[]};
+let consecOK = 0, lastFireAt = 0;
+
+function bandAvg(buf, binHz, lo, hi){
+  const i0 = Math.max(0, Math.floor(lo/binHz));
+  const i1 = Math.min(buf.length-1, Math.ceil(hi/binHz));
+  let s=0; for(let i=i0;i<=i1;i++) s += buf[i];
+  return s / (i1 - i0 + 1);
+}
+
+// Pearson correlation of two same-length arrays
+function corrNeg(a, b){
+  const n = Math.min(a.length, b.length);
+  if(n < 8) return 0;
+  let ma=0, mb=0;
+  for(let i=0;i<n;i++){ ma+=a[i]; mb+=b[i]; }
+  ma/=n; mb/=n;
+  let num=0, da=0, db=0;
+  for(let i=0;i<n;i++){
+    const xa=a[i]-ma, xb=b[i]-mb;
+    num += xa*xb; da += xa*xa; db += xb*xb;
+  }
+  const d = Math.sqrt(da*db) || 1;
+  return num/d; // -1..+1
+}
+
+function detectStrict(confBoost){
+  if(!state.an) return {conf:0, dec:false};
+  state.an.getByteFrequencyData(state.buf);
+  const sr = state.ctx.sampleRate || 44100;
+  const n  = state.an.frequencyBinCount;
+  const binHz = sr/2/n;
+
+  // main siren bands
+  const Araw = bandAvg(state.buf, binHz, 700, 900);
+  const Braw = bandAvg(state.buf, binHz, 1300, 1700);
+
+  // noise floor & voice gate
+  const floor = (bandAvg(state.buf, binHz, 100, 300) + bandAvg(state.buf, binHz, 2200, 4000))/2 + 1;
+  const voice = bandAvg(state.buf, binHz, 80, 400); // speech region
+
+  const aN = Araw / floor;
+  const bN = Braw / floor;
+  const snr = (aN + bN)/2;              // overall strength
+  const voiceHeavy = voice > (Araw + Braw) * 0.6; // lots of low-freq → likely speech
+
+  // record history (last ~20 samples ≈ 4s)
+  hist.a.push(aN); hist.b.push(bN); hist.snr.push(snr); hist.t.push(performance.now());
+  if(hist.a.length > 20){ hist.a.shift(); hist.b.shift(); hist.snr.shift(); hist.t.shift(); }
+
+  // alternation check (anti-correlated bands over window)
+  const r = corrNeg(hist.a, hist.b);   // siren → typically negative correlation
+  const altGood = r < -0.25;
+
+  // stability: last ~0.8s must be strong
+  const recent = Math.min(4, hist.a.length);
+  let strongCnt = 0;
+  for(let i=hist.snr.length - recent; i<hist.snr.length; i++){
+    if(hist.snr[i] > 2.6) strongCnt++;
+  }
+  const stable = strongCnt >= Math.round(recent*0.75);
+
+  // combine gates
+  let pass = !voiceHeavy && altGood && stable;
+
+  // min duration + debounce
+  if(pass) consecOK++; else consecOK = Math.max(0, consecOK-1);
+  const minFrames = 4; // ~0.8s at 200ms
+  const now = performance.now();
+  const debounced = (now - lastFireAt) < 1000; // keep "on" for 1s after a hit
+
+  let conf = Math.max(0, Math.min(1, (snr/4) * (altGood?1.0:0.6)));
+  conf = Math.min(1, conf * (confBoost||1));
+
+  const decision = (consecOK >= minFrames && conf > 0.65) || debounced;
+  if(consecOK >= minFrames && conf > 0.65) lastFireAt = now;
+
+  return {conf, dec: decision};
+}
+
+// in start(), change the call from detect(...) to detectStrict(...)
+function start(){
+  const label = (el('label').value||'Node-'+Math.floor(1000+Math.random()*9000)).trim();
+  const sens = Math.max(0.2, Math.min(2.0, parseFloat(el('sens').value)||0.5));
+  setInterval(()=>{
+    const out = detectStrict(1.0/sens);   // <- use strict detector
+    el('confVal').textContent = out.conf.toFixed(2);
+    el('decisionVal').textContent = out.dec ? 'SIREN DETECTED' : '—';
+    if(state.dc && state.dc.readyState==='open'){
+      const msg = { type:'siren', device:label, ts:new Date().toISOString(),
+        confidence: out.conf, detected: out.dec, geo: state.geo||null };
+      try{ state.dc.send(JSON.stringify(msg)); }catch(_){}
     }
-    const A = bandAvg(600,900);
-    const B = bandAvg(1200,1800);
-    const low = bandAvg(100,400), high = bandAvg(2000,4000);
-    const floor = (low+high)/2 + 1;
-    const aN=A/floor, bN=B/floor;
-    sample.A.push(aN); sample.B.push(bN); sample.T.push(performance.now());
-    if(sample.A.length>30){ sample.A.shift(); sample.B.shift(); sample.T.shift(); }
-    const mean=(arr)=>arr.reduce((p,c)=>p+c,0)/arr.length;
-    const ma = mean(sample.A), mb = mean(sample.B);
-    const varf = (arr,m)=>arr.reduce((p,c)=>p+(c-m)*(c-m),0)/arr.length;
-    const varA = varf(sample.A,ma), varB = varf(sample.B,mb);
-    const alt = Math.abs(aN-bN);
-    let conf = Math.max(0, Math.min(1, (aN+bN)/6 + alt/6 + (varA+varB)/8 ));
-    conf = Math.min(1, conf * (confBoost||1));
-    const decision = conf > 0.6;
-    return {conf, dec:decision};
-  }
-
-  function start(){
-    const label = (el('label').value||'Node-'+Math.floor(1000+Math.random()*9000)).trim();
-    const sens = Math.max(0.2, Math.min(2.0, parseFloat(el('sens').value)||0.5));
-    setInterval(()=>{
-      const out = detect(1.0/sens);
-      el('confVal').textContent = out.conf.toFixed(2);
-      el('decisionVal').textContent = out.dec ? 'SIREN DETECTED' : '—';
-      if(state.dc && state.dc.readyState==='open'){
-        const msg = {
-          type:'siren',
-          device: label,
-          ts: new Date().toISOString(),
-          confidence: out.conf,
-          detected: out.dec,
-          geo: state.geo||null
-        };
-        try{ state.dc.send(JSON.stringify(msg)); }catch(_){}
-      }
-    }, 200);
-  }
-
+  }, 200);
+}
   el('grantBtn').addEventListener('click', grant);
   el('offerBtn').addEventListener('click', createOffer);
   el('setAnswerBtn').addEventListener('click', setAnswer);
